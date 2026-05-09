@@ -2,21 +2,21 @@
 # ══════════════════════════════════════════════════════════════════════════════
 # XBoard Node 一键安装 & 管理脚本
 # 适配: CentOS Stream 10 (兼容 CentOS 8/9, RHEL 系)
-# 版本: v1.1.0
+# 版本: v1.2.0
 #
 # 用法:
-#   全新安装:  curl -fsSL <url> | bash
-#   再次运行:  curl -fsSL <url> | bash   (会自动检测已有安装)
+#   curl -fsSL <url> | bash
+#   或下载后: bash install.sh
 # ══════════════════════════════════════════════════════════════════════════════
 
 set -e
 
-SCRIPT_VERSION="v1.1.0"
+SCRIPT_VERSION="v1.2.0"
 INSTALL_DIR="/opt/xboard-node"
 CONFIG_FILE="$INSTALL_DIR/config/config.yml"
 LB_NODE_BIN="/usr/local/bin/lb-node"
 
-# ── 颜色定义 ─────────────────────────────────────────────────────────────────
+# ── 颜色 ─────────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -29,6 +29,15 @@ info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 step()  { echo -e "\n${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"; echo -e "${BOLD} $1${NC}"; echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"; }
+
+# ── 关键修复: 支持 curl | bash 模式下的交互输入 ──────────────────────────────
+# 当用 curl | bash 运行时，stdin 是 curl 的输出，read 读不到键盘
+# 所以统一从 /dev/tty 读取用户输入
+ask() {
+    local prompt="$1"
+    local varname="$2"
+    read -rp "$(echo -e "$prompt")" "$varname" < /dev/tty
+}
 
 # ── Root 检查 ────────────────────────────────────────────────────────────────
 [[ $EUID -ne 0 ]] && error "请使用 root 用户运行此脚本"
@@ -51,7 +60,7 @@ fi
 [ -f "$LB_NODE_BIN" ] && LBNODE_INSTALLED=true
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  主菜单 (已有安装时显示)
+#  Banner & 菜单
 # ══════════════════════════════════════════════════════════════════════════════
 
 show_banner() {
@@ -60,7 +69,6 @@ show_banner() {
     echo -e "${BOLD}  XBoard Node 安装 & 管理脚本  ${SCRIPT_VERSION}${NC}"
     echo -e "${CYAN}══════════════════════════════════════════════════════════════════════════════${NC}"
     echo ""
-    # 环境状态
     echo -e "  Docker:       $(if $DOCKER_INSTALLED; then echo -e "${GREEN}已安装${NC}"; else echo -e "${RED}未安装${NC}"; fi)"
     echo -e "  XBoard Node:  $(if $NODE_INSTALLED; then echo -e "${GREEN}已安装${NC}"; else echo -e "${RED}未安装${NC}"; fi)"
     if $NODE_INSTALLED; then
@@ -91,31 +99,25 @@ run_menu() {
     fi
     echo "  0) 退出"
     echo ""
-    read -rp "$(echo -e "${BOLD}请选择: ${NC}")" MENU_CHOICE
+    ask "${BOLD}请选择: ${NC}" MENU_CHOICE
 
     case "$MENU_CHOICE" in
         1) MODE="full_install" ;;
         2) MODE="update_script" ;;
         3)
-            if $NODE_INSTALLED; then
-                MODE="reconfigure"
-            else
-                error "XBoard Node 未安装，请先执行全新安装"
-            fi
+            $NODE_INSTALLED || error "XBoard Node 未安装，请先执行全新安装"
+            MODE="reconfigure"
             ;;
         4)
-            if $NODE_INSTALLED; then
-                MODE="update_image"
-            else
-                error "XBoard Node 未安装，请先执行全新安装"
-            fi
+            $NODE_INSTALLED || error "XBoard Node 未安装，请先执行全新安装"
+            MODE="update_image"
             ;;
         0) info "退出"; exit 0 ;;
         *) error "无效选择" ;;
     esac
 }
 
-# 如果是全新环境 (没装过)，直接进全量安装，不显示菜单
+# 全新环境直接装，不显示菜单
 if ! $NODE_INSTALLED && ! $LBNODE_INSTALLED; then
     MODE="full_install"
     show_banner
@@ -124,12 +126,10 @@ else
     run_menu
 fi
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  函数定义
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── 检测系统 ─────────────────────────────────────────────────────────────────
 detect_system() {
     step "系统检测"
     if [ -f /etc/os-release ]; then
@@ -151,14 +151,12 @@ detect_system() {
     info "包管理器: $PKG_MGR"
 }
 
-# ── 检测 V2bX ────────────────────────────────────────────────────────────────
 detect_v2bx() {
     step "检测已有节点后端"
 
     V2BX_FOUND=false
     V2BX_TYPE=""
 
-    # systemd
     if systemctl list-unit-files 2>/dev/null | grep -qi "v2bx\|V2bX"; then
         V2BX_FOUND=true
         V2BX_TYPE="systemd"
@@ -168,10 +166,9 @@ detect_v2bx() {
         else
             V2BX_STATUS="已停止"
         fi
-        info "发现 V2bX (systemd 服务): $V2BX_SERVICE [$V2BX_STATUS]"
+        info "发现 V2bX (systemd): $V2BX_SERVICE [$V2BX_STATUS]"
     fi
 
-    # docker
     if command -v docker &>/dev/null; then
         V2BX_CONTAINER=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -i "v2bx" | head -1)
         if [[ -n "$V2BX_CONTAINER" ]]; then
@@ -182,11 +179,10 @@ detect_v2bx() {
             else
                 V2BX_STATUS="已停止"
             fi
-            info "发现 V2bX (Docker 容器): $V2BX_CONTAINER [$V2BX_STATUS]"
+            info "发现 V2bX (Docker): $V2BX_CONTAINER [$V2BX_STATUS]"
         fi
     fi
 
-    # binary
     if ! $V2BX_FOUND; then
         V2BX_BIN=$(command -v V2bX 2>/dev/null || command -v v2bx 2>/dev/null || true)
         if [[ -z "$V2BX_BIN" ]]; then
@@ -197,21 +193,21 @@ detect_v2bx() {
         if [[ -n "$V2BX_BIN" ]]; then
             V2BX_FOUND=true
             V2BX_TYPE="binary"
-            info "发现 V2bX 二进制文件: $V2BX_BIN"
+            info "发现 V2bX 二进制: $V2BX_BIN"
         fi
     fi
 
     if $V2BX_FOUND; then
         echo ""
-        warn "检测到已安装 V2bX，它与 XBoard Node 可能产生端口冲突"
+        warn "检测到已安装 V2bX，可能产生端口冲突"
         echo ""
         echo -e "${BOLD}请选择操作:${NC}"
-        echo "  1) 卸载 V2bX (停止服务 + 删除文件)"
-        echo "  2) 仅停止 V2bX (保留文件，可稍后恢复)"
-        echo "  3) 跳过，不处理 (可能端口冲突)"
+        echo "  1) 卸载 V2bX (停止 + 删除)"
+        echo "  2) 仅停止 V2bX (保留文件)"
+        echo "  3) 跳过不处理"
         echo "  0) 退出安装"
         echo ""
-        read -rp "$(echo -e "${BOLD}请选择 [0/1/2/3]: ${NC}")" V2BX_ACTION
+        ask "${BOLD}请选择 [0/1/2/3]: ${NC}" V2BX_ACTION
 
         case "$V2BX_ACTION" in
             1)
@@ -221,19 +217,19 @@ detect_v2bx() {
                     systemctl disable "$V2BX_SERVICE" 2>/dev/null || true
                     rm -f "/etc/systemd/system/$V2BX_SERVICE" 2>/dev/null || true
                     systemctl daemon-reload 2>/dev/null || true
-                    info "已停止并移除 systemd 服务: $V2BX_SERVICE"
+                    info "已移除 systemd 服务: $V2BX_SERVICE"
                 fi
                 if [[ "$V2BX_TYPE" == "docker" ]]; then
                     docker stop "$V2BX_CONTAINER" 2>/dev/null || true
                     docker rm "$V2BX_CONTAINER" 2>/dev/null || true
-                    info "已停止并删除 Docker 容器: $V2BX_CONTAINER"
+                    info "已删除容器: $V2BX_CONTAINER"
                 fi
                 for p in /usr/local/bin/V2bX /usr/local/bin/v2bx /opt/V2bX /usr/bin/V2bX; do
                     [ -e "$p" ] && rm -rf "$p" && info "已删除: $p"
                 done
                 for cfg in /etc/V2bX /etc/v2bx /usr/local/etc/V2bX; do
                     if [ -d "$cfg" ]; then
-                        read -rp "$(echo -e "${YELLOW}是否删除配置目录 $cfg？[y/N]: ${NC}")" DEL_CFG
+                        ask "${YELLOW}是否删除配置目录 $cfg？[y/N]: ${NC}" DEL_CFG
                         [[ "$DEL_CFG" =~ ^[Yy]$ ]] && rm -rf "$cfg" && info "已删除: $cfg" || info "保留: $cfg"
                     fi
                 done
@@ -260,20 +256,17 @@ detect_v2bx() {
     fi
 }
 
-# ── 安装依赖 ─────────────────────────────────────────────────────────────────
 install_dependencies() {
     step "安装依赖 (Docker & Git)"
 
-    # 禁用 EPEL
     for repo in epel epel-cisco-openh264 epel-next; do
         if [ -f "/etc/yum.repos.d/${repo}.repo" ] || $PKG_MGR repolist --enabled 2>/dev/null | grep -qi "$repo"; then
-            warn "禁用有问题的仓库: $repo"
+            warn "禁用仓库: $repo"
             $PKG_MGR config-manager --set-disabled "$repo" 2>/dev/null || true
         fi
     done
     DNF_OPTS="--disablerepo=epel --disablerepo=epel-cisco-openh264 --disablerepo=epel-next"
 
-    # Git
     if command -v git &>/dev/null; then
         info "Git 已安装: $(git --version)"
     else
@@ -282,7 +275,6 @@ install_dependencies() {
         info "Git 安装完成: $(git --version)"
     fi
 
-    # Docker
     if command -v docker &>/dev/null; then
         info "Docker 已安装: $(docker --version)"
     else
@@ -291,9 +283,8 @@ install_dependencies() {
             docker-common docker-latest docker-engine podman buildah 2>/dev/null || true
         $PKG_MGR install -y $DNF_OPTS dnf-plugins-core || true
 
-        if [ ! -f /etc/yum.repos.d/docker-ce.repo ]; then
+        [ ! -f /etc/yum.repos.d/docker-ce.repo ] && \
             $PKG_MGR config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-        fi
 
         MAJOR_VER="${OS_VERSION%%.*}"
         if [[ "$MAJOR_VER" -ge 10 ]]; then
@@ -307,7 +298,6 @@ install_dependencies() {
         info "Docker 安装完成: $(docker --version)"
     fi
 
-    # 启动 Docker
     if ! systemctl is-active docker &>/dev/null; then
         systemctl start docker
         systemctl enable docker
@@ -320,13 +310,12 @@ install_dependencies() {
     info "Docker Compose: $(docker compose version --short)"
 }
 
-# ── 克隆仓库 ─────────────────────────────────────────────────────────────────
 clone_repo() {
     step "克隆 xboard-node 仓库"
 
     if [ -d "$INSTALL_DIR" ]; then
         warn "目录 $INSTALL_DIR 已存在"
-        read -rp "$(echo -e "${YELLOW}是否删除并重新克隆？[y/N]: ${NC}")" RECLONE
+        ask "${YELLOW}是否删除并重新克隆？[y/N]: ${NC}" RECLONE
         if [[ "$RECLONE" =~ ^[Yy]$ ]]; then
             if [ -f "$INSTALL_DIR/compose.yml" ]; then
                 info "停止已有容器..."
@@ -347,47 +336,39 @@ clone_repo() {
     fi
 }
 
-# ── 交互式配置 ───────────────────────────────────────────────────────────────
 interactive_config() {
     step "配置 XBoard Node"
     echo ""
 
-    # Panel URL
     while true; do
-        read -rp "$(echo -e "${BOLD}面板地址 (Panel URL): ${NC}")" PANEL_URL
-        if [[ -n "$PANEL_URL" ]]; then
-            PANEL_URL="${PANEL_URL%/}"
-            break
-        fi
+        ask "${BOLD}面板地址 (Panel URL): ${NC}" PANEL_URL
+        [[ -n "$PANEL_URL" ]] && { PANEL_URL="${PANEL_URL%/}"; break; }
         warn "面板地址不能为空"
     done
 
-    # Token
     while true; do
-        read -rp "$(echo -e "${BOLD}通信密钥 (Token): ${NC}")" PANEL_TOKEN
+        ask "${BOLD}通信密钥 (Token): ${NC}" PANEL_TOKEN
         [[ -n "$PANEL_TOKEN" ]] && break
         warn "Token 不能为空"
     done
 
-    # Kernel
     echo ""
     echo -e "${BOLD}内核类型:${NC}"
     echo "  1) singbox (默认)"
     echo "  2) xray"
-    read -rp "$(echo -e "${BOLD}请选择 [1/2] (默认 1): ${NC}")" KERNEL_CHOICE
+    ask "${BOLD}请选择 [1/2] (默认 1): ${NC}" KERNEL_CHOICE
     case "$KERNEL_CHOICE" in
         2) KERNEL_TYPE="xray" ;;
         *) KERNEL_TYPE="singbox" ;;
     esac
     info "内核: $KERNEL_TYPE"
 
-    # Cert
     echo ""
     echo -e "${BOLD}证书模式:${NC}"
     echo "  1) self  - 自签证书 (默认)"
     echo "  2) http  - ACME HTTP-01"
     echo "  3) none  - 不使用 TLS"
-    read -rp "$(echo -e "${BOLD}请选择 [1/2/3] (默认 1): ${NC}")" CERT_CHOICE
+    ask "${BOLD}请选择 [1/2/3] (默认 1): ${NC}" CERT_CHOICE
     case "$CERT_CHOICE" in
         2) CERT_MODE="http" ;;
         3) CERT_MODE="none" ;;
@@ -395,13 +376,12 @@ interactive_config() {
     esac
     info "证书模式: $CERT_MODE"
 
-    # Node IDs
     echo ""
     echo -e "${BOLD}配置节点 ID (输入完毕后直接按回车结束):${NC}"
     NODE_IDS=()
     NODE_COUNT=1
     while true; do
-        read -rp "$(echo -e "  节点 ${NODE_COUNT} 的 ID (留空结束): ")" NODE_INPUT
+        ask "  节点 ${NODE_COUNT} 的 ID (留空结束): " NODE_INPUT
         if [[ -z "$NODE_INPUT" ]]; then
             [[ ${#NODE_IDS[@]} -eq 0 ]] && warn "至少需要一个节点 ID" && continue
             break
@@ -414,11 +394,9 @@ interactive_config() {
     info "节点列表: ${NODE_IDS[*]}"
 }
 
-# ── 生成配置文件 ─────────────────────────────────────────────────────────────
 generate_config() {
     mkdir -p "$INSTALL_DIR/config"
 
-    # 备份旧配置
     if [ -f "$CONFIG_FILE" ]; then
         BACKUP="$CONFIG_FILE.bak.$(date +%Y%m%d%H%M%S)"
         cp "$CONFIG_FILE" "$BACKUP"
@@ -463,10 +441,9 @@ EOF
     echo -e "${CYAN}───────────────────────────────────────────────────────────────────────────${NC}"
 }
 
-# ── 启动服务 ─────────────────────────────────────────────────────────────────
 start_service() {
     echo ""
-    read -rp "$(echo -e "${BOLD}确认启动？[Y/n]: ${NC}")" CONFIRM_START
+    ask "${BOLD}确认启动？[Y/n]: ${NC}" CONFIRM_START
     if [[ "$CONFIRM_START" =~ ^[Nn]$ ]]; then
         info "已跳过启动。手动执行: cd $INSTALL_DIR && docker compose up -d"
         return
@@ -478,7 +455,6 @@ start_service() {
     info "服务已启动"
 }
 
-# ── 安装 lb-node 命令 ────────────────────────────────────────────────────────
 install_lbnode() {
     step "安装 lb-node 快捷命令"
 
@@ -666,10 +642,9 @@ esac
 LBEOF
 
     chmod +x "$LB_NODE_BIN"
-    info "lb-node 命令已安装 ($(cat "$LB_NODE_BIN" | head -3 | tail -1))"
+    info "lb-node 命令已安装"
 }
 
-# ── 完成信息 ─────────────────────────────────────────────────────────────────
 show_done() {
     echo ""
     echo -e "${GREEN}══════════════════════════════════════════════════════════════════════════════${NC}"
@@ -696,9 +671,8 @@ show_done() {
     echo ""
 }
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-#  执行对应模式
+#  执行
 # ══════════════════════════════════════════════════════════════════════════════
 
 case "$MODE" in
@@ -713,23 +687,18 @@ case "$MODE" in
         install_lbnode
         show_done
         ;;
-
     update_script)
-        # 只更新 lb-node 命令，不碰 Docker / 配置 / 容器
         install_lbnode
-        info "lb-node 命令已更新到最新版本"
         if $NODE_RUNNING; then
             info "服务运行中，未做任何改动"
         fi
         show_done
         ;;
-
     reconfigure)
-        # 重新填配置，重启服务
         interactive_config
         generate_config
         echo ""
-        read -rp "$(echo -e "${BOLD}是否重启服务使新配置生效？[Y/n]: ${NC}")" DO_RESTART
+        ask "${BOLD}是否重启服务使新配置生效？[Y/n]: ${NC}" DO_RESTART
         if [[ ! "$DO_RESTART" =~ ^[Nn]$ ]]; then
             cd "$INSTALL_DIR"
             docker compose restart
@@ -738,9 +707,7 @@ case "$MODE" in
         install_lbnode
         show_done
         ;;
-
     update_image)
-        # 拉最新镜像并重启
         step "更新镜像"
         cd "$INSTALL_DIR"
         docker compose pull
