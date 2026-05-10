@@ -660,7 +660,9 @@ tcp_apply() {
 
     # IPv6 选择
     local ipv6_disable=""
-    ask "${BOLD}永久禁用 IPv6？(纯 IPv4 节点建议禁用) [y/N]: ${NC}" ipv6_disable
+    echo ""
+    warn "若节点配置使用了 IPv6 监听 (::) 或面板走 IPv6，请勿禁用！"
+    ask "${BOLD}永久禁用 IPv6？(默认 N，建议默认保持) [y/N]: ${NC}" ipv6_disable
 
     # 备份 + 清理冲突
     info "清理冲突的 sysctl 配置..."
@@ -723,7 +725,8 @@ net.ipv4.tcp_wmem = 4096 65536 ${buffer_bytes}
 net.ipv4.udp_rmem_min = 8192
 net.ipv4.udp_wmem_min = 8192
 net.ipv4.tcp_syncookies = 1
-net.ipv4.ip_local_port_range = 1024 65535
+# 临时端口范围保持 32768+ 避免和代理监听端口 (443/8443/8080 等) 冲突
+net.ipv4.ip_local_port_range = 32768 65535
 vm.swappiness = ${vm_swappiness}
 vm.dirty_ratio = ${vm_dirty_ratio}
 vm.dirty_background_ratio = 5
