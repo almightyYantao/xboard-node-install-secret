@@ -11,7 +11,7 @@
 
 set -e
 
-SCRIPT_VERSION="v1.3.0"
+SCRIPT_VERSION="v1.4.0"
 INSTALL_DIR="/opt/xboard-node"
 CONFIG_FILE="$INSTALL_DIR/config/config.yml"
 LB_NODE_BIN="/usr/local/bin/lb-node"
@@ -102,6 +102,7 @@ run_menu() {
         echo "  4) 更新镜像 (拉最新 xboard-node 镜像)"
     fi
     echo "  5) 安装/管理 TrafficBoard 监控"
+    echo "  6) TCP 网络优化 (BBR + FQ + 缓冲调优)"
     echo "  0) 退出"
     echo ""
     ask "${BOLD}请选择: ${NC}" MENU_CHOICE
@@ -112,6 +113,7 @@ run_menu() {
         3) $NODE_INSTALLED || error "未安装，请先全新安装"; MODE="reconfigure" ;;
         4) $NODE_INSTALLED || error "未安装，请先全新安装"; MODE="update_image" ;;
         5) MODE="reporter_manage" ;;
+        6) MODE="tcp_optimize" ;;
         0) exit 0 ;;
         *) error "无效选择" ;;
     esac
@@ -452,6 +454,256 @@ manage_reporter() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  TCP 网络优化 (BBR + FQ + 缓冲调优)
+#  注: 仅使用内核自带 BBR v1，不安装 XanMod；不修改 DNS。
+# ══════════════════════════════════════════════════════════════════════════════
+
+TCP_SYSCTL_CONF="/etc/sysctl.d/99-xboard-tcp.conf"
+TCP_IPV6_CONF="/etc/sysctl.d/99-xboard-disable-ipv6.conf"
+TCP_BBR_MODULE="/etc/modules-load.d/99-xboard-bbr.conf"
+TCP_LIMITS_CONF="/etc/systemd/system.conf.d/99-xboard-limits.conf"
+TCP_BACKUP_DIR="/var/backups/xboard-tcp"
+
+manage_tcp() {
+    step "TCP 网络优化"
+
+    local cur_cc cur_qdisc cur_v6
+    cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+    cur_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
+    cur_v6=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "0")
+
+    echo ""
+    echo -e "${BOLD}当前内核网络状态:${NC}"
+    echo -e "  拥塞控制:  ${cur_cc}"
+    echo -e "  默认队列:  ${cur_qdisc}"
+    echo -e "  IPv6 禁用: $([ "$cur_v6" = "1" ] && echo "是" || echo "否")"
+
+    local applied=false
+    [ -f "$TCP_SYSCTL_CONF" ] && applied=true
+
+    echo ""
+    if $applied; then
+        echo -e "  ${GREEN}● 已应用 XBoard TCP 优化${NC}"
+        echo ""
+        echo "  1) 重新优化 (重新选档并应用)"
+        echo "  2) 查看当前配置"
+        echo "  3) 还原 (移除优化，恢复冲突项)"
+        echo "  0) 返回"
+    else
+        echo -e "  ${YELLOW}● 尚未应用 TCP 优化${NC}"
+        echo ""
+        echo "  1) 应用 TCP 优化"
+        echo "  0) 返回"
+    fi
+    echo ""
+    ask "${BOLD}请选择: ${NC}" T_CHOICE
+
+    case "$T_CHOICE" in
+        1) tcp_apply ;;
+        2) $applied && { echo ""; cat "$TCP_SYSCTL_CONF"; echo ""; } ;;
+        3) $applied && tcp_revert ;;
+        0) return ;;
+        *) warn "无效选择" ;;
+    esac
+}
+
+tcp_apply() {
+    # 检查 BBR 内核支持
+    if ! modprobe tcp_bbr 2>/dev/null && ! sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q bbr; then
+        error "当前内核不支持 BBR，请升级内核 (Linux ≥ 4.9)"
+    fi
+
+    # 内存检测
+    local mem_mb
+    mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 1024)
+    info "系统内存: ${mem_mb} MB"
+
+    # 缓冲档位选择
+    echo ""
+    echo -e "${BOLD}请按服务器带宽选择 TCP 缓冲档位:${NC}"
+    echo "  1) 16MB   (≤100Mbps / 小内存保守)"
+    echo "  2) 32MB   (100-500Mbps 标准)"
+    echo "  3) 64MB   (500Mbps-1Gbps 推荐)"
+    echo "  4) 128MB  (1-2.5Gbps)"
+    echo "  5) 256MB  (≥2.5Gbps 极限)"
+    echo ""
+    echo "  提示: 缓冲不是越大越好，过大会增加内存压力和 bufferbloat。"
+    echo ""
+    ask "${BOLD}选择 [3]: ${NC}" BUF_CHOICE
+
+    local buffer_mb
+    case "${BUF_CHOICE:-3}" in
+        1) buffer_mb=16 ;;
+        2) buffer_mb=32 ;;
+        3) buffer_mb=64 ;;
+        4) buffer_mb=128 ;;
+        5) buffer_mb=256 ;;
+        *) buffer_mb=64 ;;
+    esac
+
+    # 内存上限保护
+    local cap=256 reason="bandwidth-tier"
+    if   [ "$mem_mb" -lt 1024 ]; then cap=16;  reason="<1GB RAM cap"
+    elif [ "$mem_mb" -lt 2048 ]; then cap=32;  reason="<2GB RAM cap"
+    elif [ "$mem_mb" -lt 4096 ]; then cap=128; reason="<4GB RAM cap"
+    fi
+    if [ "$buffer_mb" -gt "$cap" ]; then
+        warn "内存限制: ${buffer_mb}MB → ${cap}MB ($reason)"
+        buffer_mb=$cap
+    fi
+    local buffer_bytes=$((buffer_mb * 1024 * 1024))
+    info "TCP 缓冲: ${buffer_mb}MB"
+
+    # IPv6 选择
+    local ipv6_disable=""
+    ask "${BOLD}永久禁用 IPv6？(纯 IPv4 节点建议禁用) [y/N]: ${NC}" ipv6_disable
+
+    # 备份 + 清理冲突
+    info "清理冲突的 sysctl 配置..."
+    mkdir -p "$TCP_BACKUP_DIR"
+    local ts; ts=$(date +%Y%m%d%H%M%S)
+    if [ -f /etc/sysctl.conf ]; then
+        cp /etc/sysctl.conf "$TCP_BACKUP_DIR/sysctl.conf.bak.$ts"
+        sed -i -E '/^net\.core\.(rmem_max|wmem_max)/s/^/# xboard-tcp disabled: /' /etc/sysctl.conf 2>/dev/null || true
+        sed -i -E '/^net\.ipv4\.tcp_(rmem|wmem|congestion_control)/s/^/# xboard-tcp disabled: /' /etc/sysctl.conf 2>/dev/null || true
+    fi
+    find /etc/sysctl.d -maxdepth 1 -type f \
+        ! -name '99-xboard-tcp.conf' ! -name '99-xboard-disable-ipv6.conf' 2>/dev/null | while read -r conf; do
+        if grep -qE '^(net\.core\.(rmem_max|wmem_max)|net\.ipv4\.tcp_(rmem|wmem|congestion_control))' "$conf" 2>/dev/null; then
+            cp "$conf" "$TCP_BACKUP_DIR/$(basename "$conf").bak.$ts"
+            sed -i -E '/^net\.core\.(rmem_max|wmem_max)/s/^/# xboard-tcp disabled: /;/^net\.ipv4\.tcp_(rmem|wmem|congestion_control)/s/^/# xboard-tcp disabled: /' "$conf" 2>/dev/null || true
+        fi
+    done
+
+    # BBR 模块持久化
+    cat > "$TCP_BBR_MODULE" <<'EOF'
+tcp_bbr
+EOF
+
+    # vm 调优 (小内存机器用更保守的值)
+    local vm_swappiness=10 vm_dirty_ratio=15 vm_min_free_kbytes=65536
+    if [ "$mem_mb" -lt 2048 ]; then
+        vm_swappiness=20
+        vm_min_free_kbytes=32768
+    fi
+
+    # 写 sysctl 配置
+    cat > "$TCP_SYSCTL_CONF" <<EOF
+# XBoard Node TCP 优化 — $(date '+%Y-%m-%d %H:%M:%S')
+# 内存: ${mem_mb}MB | 缓冲: ${buffer_mb}MB | 策略: ${reason}
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_synack_retries = 3
+net.ipv4.tcp_max_syn_backlog = 16384
+net.ipv4.tcp_max_tw_buckets = 2000000
+net.ipv4.tcp_abort_on_overflow = 0
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 250000
+net.core.rmem_max = ${buffer_bytes}
+net.core.wmem_max = ${buffer_bytes}
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.ipv4.tcp_rmem = 4096 87380 ${buffer_bytes}
+net.ipv4.tcp_wmem = 4096 65536 ${buffer_bytes}
+net.ipv4.udp_rmem_min = 8192
+net.ipv4.udp_wmem_min = 8192
+net.ipv4.tcp_syncookies = 1
+net.ipv4.ip_local_port_range = 1024 65535
+vm.swappiness = ${vm_swappiness}
+vm.dirty_ratio = ${vm_dirty_ratio}
+vm.dirty_background_ratio = 5
+vm.overcommit_memory = 1
+vm.min_free_kbytes = ${vm_min_free_kbytes}
+vm.vfs_cache_pressure = 50
+EOF
+
+    info "应用 sysctl 参数..."
+    if ! sysctl -p "$TCP_SYSCTL_CONF" >/dev/null 2>&1; then
+        warn "部分 sysctl 参数应用失败，已保留可用项"
+    fi
+
+    # FQ qdisc 应用到物理网卡
+    info "应用 FQ 队列..."
+    local fq_ok=0 fq_total=0 dev
+    for dev in $(ls /sys/class/net 2>/dev/null | grep -vE '^(lo|docker|veth|br-|virbr|tun|tap)'); do
+        fq_total=$((fq_total + 1))
+        tc qdisc replace dev "$dev" root fq >/dev/null 2>&1 || true
+        tc qdisc show dev "$dev" 2>/dev/null | grep -q '^qdisc fq ' && fq_ok=$((fq_ok + 1))
+    done
+    info "FQ 队列: ${fq_ok}/${fq_total} 个网卡已应用"
+
+    # 文件句柄上限
+    if ! grep -q 'XBoard Node file descriptor limits' /etc/security/limits.conf 2>/dev/null; then
+        cat >> /etc/security/limits.conf <<'EOF'
+
+# XBoard Node file descriptor limits
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+EOF
+    fi
+    mkdir -p /etc/systemd/system.conf.d
+    cat > "$TCP_LIMITS_CONF" <<'EOF'
+[Manager]
+DefaultLimitNOFILE=1048576
+DefaultLimitNPROC=1048576
+EOF
+    systemctl daemon-reexec >/dev/null 2>&1 || true
+
+    # IPv6
+    if [[ "$ipv6_disable" =~ ^[Yy]$ ]]; then
+        cat > "$TCP_IPV6_CONF" <<'EOF'
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+        sysctl -p "$TCP_IPV6_CONF" >/dev/null 2>&1 || true
+        info "已禁用 IPv6"
+    else
+        rm -f "$TCP_IPV6_CONF"
+    fi
+
+    echo ""
+    echo -e "${GREEN}✓ TCP 优化已应用${NC}"
+    echo -e "  拥塞控制:  $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+    echo -e "  默认队列:  $(sysctl -n net.core.default_qdisc 2>/dev/null)"
+    echo -e "  TCP 缓冲:  ${buffer_mb}MB"
+    echo -e "  文件句柄:  1048576"
+    echo ""
+    info "配置文件: $TCP_SYSCTL_CONF"
+    info "备份目录: $TCP_BACKUP_DIR"
+    warn "建议重启 xboard-node 容器使新缓冲生效: lb-node restart"
+}
+
+tcp_revert() {
+    info "移除 TCP 优化配置..."
+    rm -f "$TCP_SYSCTL_CONF" "$TCP_IPV6_CONF" "$TCP_BBR_MODULE" "$TCP_LIMITS_CONF"
+    sed -i '/# XBoard Node file descriptor limits/,/^root hard nofile/d' /etc/security/limits.conf 2>/dev/null || true
+
+    # 恢复被注释掉的冲突项
+    sed -i 's/^# xboard-tcp disabled: //' /etc/sysctl.conf 2>/dev/null || true
+    find /etc/sysctl.d -maxdepth 1 -type f 2>/dev/null | while read -r conf; do
+        sed -i 's/^# xboard-tcp disabled: //' "$conf" 2>/dev/null || true
+    done
+
+    sysctl --system >/dev/null 2>&1 || true
+    systemctl daemon-reexec >/dev/null 2>&1 || true
+    info "已移除（重启后完全生效）"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  安装 lb-node
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -675,5 +927,8 @@ case "$MODE" in
     reporter_manage)
         manage_reporter
         install_lbnode
+        ;;
+    tcp_optimize)
+        manage_tcp
         ;;
 esac
