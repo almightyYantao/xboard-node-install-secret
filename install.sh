@@ -544,26 +544,26 @@ mbps_to_buffer_mb() {
 }
 
 run_speedtest_mbps() {
-    # 输出上传带宽 Mbps；失败返回非 0
+    # 输出上传带宽 Mbps 到 stdout；所有提示走 stderr 避免污染 $(…) 捕获
     local upload_mbps speedtest_bin
     speedtest_bin="$(command -v speedtest-cli || true)"
     if [ -z "$speedtest_bin" ]; then
-        info "安装 speedtest-cli (单文件 Python 脚本)..."
+        info "安装 speedtest-cli (单文件 Python 脚本)..." >&2
         if curl -fsSL "https://raw.githubusercontent.com/sivel/speedtest-cli/master/speedtest.py" \
             -o /usr/local/bin/speedtest-cli 2>/dev/null && chmod +x /usr/local/bin/speedtest-cli; then
             speedtest_bin="/usr/local/bin/speedtest-cli"
         else
-            warn "下载 speedtest-cli 失败"
+            warn "下载 speedtest-cli 失败" >&2
             return 1
         fi
     fi
-    command -v python3 >/dev/null 2>&1 || { warn "speedtest-cli 需要 python3"; return 1; }
-    info "跑 Ookla speedtest (约 30-60 秒)..."
+    command -v python3 >/dev/null 2>&1 || { warn "speedtest-cli 需要 python3" >&2; return 1; }
+    info "跑 Ookla speedtest (约 30-60 秒)..." >&2
     upload_mbps=$(python3 "$speedtest_bin" --simple --no-download 2>/dev/null | awk '/Upload:/ {print int($2)}')
     if [[ "$upload_mbps" =~ ^[0-9]+$ ]] && [ "$upload_mbps" -gt 0 ]; then
         echo "$upload_mbps"; return 0
     fi
-    warn "speedtest 未返回有效结果"
+    warn "speedtest 未返回有效结果" >&2
     return 1
 }
 
