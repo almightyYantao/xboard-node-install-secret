@@ -796,6 +796,65 @@ cmd_reporter() {
     esac
 }
 
+cmd_tcp() {
+    case "${1:-check}" in
+        check|status|st)
+            local cc qdisc bbr_loaded fq_count fq_total rmem_max wmem_max nofile fastopen
+            cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
+            qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
+            bbr_loaded=$(lsmod 2>/dev/null | grep -c '^tcp_bbr')
+            rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+            wmem_max=$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)
+            fastopen=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo 0)
+            nofile=$(ulimit -n 2>/dev/null || echo "?")
+            fq_count=0; fq_total=0
+            for d in $(ls /sys/class/net 2>/dev/null | grep -vE '^(lo|docker|veth|br-|virbr|tun|tap)'); do
+                fq_total=$((fq_total + 1))
+                tc qdisc show dev "$d" 2>/dev/null | grep -q '^qdisc fq ' && fq_count=$((fq_count + 1))
+            done
+
+            chk() { [ "$1" = "$2" ] && echo -e "${GREEN}✓${NC}" || echo -e "${RED}✗${NC}"; }
+            chk_ge() { [ "$1" -ge "$2" ] 2>/dev/null && echo -e "${GREEN}✓${NC}" || echo -e "${RED}✗${NC}"; }
+
+            echo ""
+            echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
+            echo -e "${BOLD}  TCP 优化状态检查${NC}"
+            echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
+            echo ""
+            echo -e "  $(chk "$cc" bbr)         拥塞控制:    ${cc} ${cc:+(期望 bbr)}"
+            echo -e "  $(chk "$qdisc" fq)         默认队列:    ${qdisc} (期望 fq)"
+            echo -e "  $(chk_ge "$bbr_loaded" 1)         BBR 模块:    $([ "$bbr_loaded" -ge 1 ] && echo "已加载" || echo "未加载")"
+            echo -e "  $(chk_ge "$fq_count" 1)         FQ 网卡:     ${fq_count}/${fq_total} 个物理网卡已应用"
+            echo -e "  $(chk_ge "$rmem_max" 16777216)         rmem_max:    $((rmem_max/1024/1024))MB"
+            echo -e "  $(chk_ge "$wmem_max" 16777216)         wmem_max:    $((wmem_max/1024/1024))MB"
+            echo -e "  $(chk "$fastopen" 3)         TCP Fastopen: ${fastopen} (期望 3)"
+            echo -e "             文件句柄上限: ${nofile}"
+            echo ""
+
+            local conf="/etc/sysctl.d/99-xboard-tcp.conf"
+            if [ -f "$conf" ]; then
+                echo -e "${BOLD}[配置文件]${NC} $conf"
+                grep -E "^# (内存|Bandwidth)" "$conf" 2>/dev/null | head -2 | sed 's/^/  /'
+            else
+                echo -e "${YELLOW}● 未应用 XBoard TCP 优化配置${NC}"
+                echo -e "  运行: ${CYAN}bash <(curl -fsSL <脚本URL>)${NC} → 选择 6"
+            fi
+            echo ""
+            ;;
+        bench)
+            command -v iperf3 >/dev/null 2>&1 || { echo -e "${YELLOW}未安装 iperf3${NC}，安装中..."; (command -v dnf >/dev/null && dnf install -y iperf3) || (command -v yum >/dev/null && yum install -y iperf3) || { echo "安装失败"; exit 1; }; }
+            echo -e "${BOLD}启动 iperf3 服务端 (端口 5201)${NC}"
+            echo "客户端测试命令:"
+            echo "  iperf3 -c $(curl -s -4 ifconfig.me 2>/dev/null || echo "<本机IP>") -t 30 -P 4"
+            echo "  iperf3 -c $(curl -s -4 ifconfig.me 2>/dev/null || echo "<本机IP>") -t 30 -R   # 反向"
+            echo ""
+            echo "Ctrl+C 退出"
+            iperf3 -s
+            ;;
+        *) echo "用法: lb-node tcp {check|bench}" ;;
+    esac
+}
+
 cmd_uninstall() {
     check_install
     echo -e "${RED}⚠  即将卸载 XBoard Node${NC}"
@@ -826,6 +885,8 @@ cmd_help() {
     echo -e "  ${GREEN}reset${NC}               重建容器(清数据卷)"
     echo -e "  ${GREEN}reporter${NC} {cmd}      TrafficBoard 监控管理"
     echo "                     status / logs / restart / stop / start"
+    echo -e "  ${GREEN}tcp${NC} {cmd}           TCP 优化检查 / 性能测试"
+    echo "                     check (默认) / bench (启动 iperf3)"
     echo -e "  ${GREEN}uninstall${NC}           卸载"
     echo ""
 }
@@ -840,6 +901,7 @@ case "${1:-help}" in
     update|upgrade|pull)   cmd_update              ;;
     reset)                 cmd_reset               ;;
     reporter|tb|monitor)   shift; cmd_reporter "$@" ;;
+    tcp|tcp-check|tc)      shift; cmd_tcp "$@"      ;;
     uninstall|remove|rm)   cmd_uninstall           ;;
     help|-h|--help)        cmd_help                ;;
     *) echo -e "${RED}未知: $1${NC}"; cmd_help; exit 1 ;;
