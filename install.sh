@@ -507,6 +507,66 @@ manage_tcp() {
     esac
 }
 
+detect_link_speed_mbps() {
+    # 输出 Mbps 整数；失败返回非 0
+    local iface speed
+    iface=$(ip -4 route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+    [ -z "$iface" ] && return 1
+    LINK_IFACE="$iface"
+
+    if command -v ethtool >/dev/null 2>&1; then
+        speed=$(ethtool "$iface" 2>/dev/null | awk -F: '/Speed:/ {gsub(/[^0-9]/,"",$2); print $2}')
+        if [[ "$speed" =~ ^[0-9]+$ ]] && [ "$speed" -gt 0 ]; then
+            LINK_SOURCE="ethtool"
+            echo "$speed"; return 0
+        fi
+    fi
+
+    if [ -r "/sys/class/net/$iface/speed" ]; then
+        speed=$(cat "/sys/class/net/$iface/speed" 2>/dev/null)
+        if [[ "$speed" =~ ^[0-9]+$ ]] && [ "$speed" -gt 0 ]; then
+            LINK_SOURCE="sysfs"
+            echo "$speed"; return 0
+        fi
+    fi
+
+    return 1
+}
+
+mbps_to_buffer_mb() {
+    local mbps="$1"
+    if   [ "$mbps" -le 100 ];  then echo 16
+    elif [ "$mbps" -le 500 ];  then echo 32
+    elif [ "$mbps" -le 1000 ]; then echo 64
+    elif [ "$mbps" -le 2500 ]; then echo 128
+    else echo 256
+    fi
+}
+
+run_speedtest_mbps() {
+    # 输出上传带宽 Mbps；失败返回非 0
+    local upload_mbps speedtest_bin
+    speedtest_bin="$(command -v speedtest-cli || true)"
+    if [ -z "$speedtest_bin" ]; then
+        info "安装 speedtest-cli (单文件 Python 脚本)..."
+        if curl -fsSL "https://raw.githubusercontent.com/sivel/speedtest-cli/master/speedtest.py" \
+            -o /usr/local/bin/speedtest-cli 2>/dev/null && chmod +x /usr/local/bin/speedtest-cli; then
+            speedtest_bin="/usr/local/bin/speedtest-cli"
+        else
+            warn "下载 speedtest-cli 失败"
+            return 1
+        fi
+    fi
+    command -v python3 >/dev/null 2>&1 || { warn "speedtest-cli 需要 python3"; return 1; }
+    info "跑 Ookla speedtest (约 30-60 秒)..."
+    upload_mbps=$(python3 "$speedtest_bin" --simple --no-download 2>/dev/null | awk '/Upload:/ {print int($2)}')
+    if [[ "$upload_mbps" =~ ^[0-9]+$ ]] && [ "$upload_mbps" -gt 0 ]; then
+        echo "$upload_mbps"; return 0
+    fi
+    warn "speedtest 未返回有效结果"
+    return 1
+}
+
 tcp_apply() {
     # 检查 BBR 内核支持
     if ! modprobe tcp_bbr 2>/dev/null && ! sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q bbr; then
@@ -518,27 +578,71 @@ tcp_apply() {
     mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 1024)
     info "系统内存: ${mem_mb} MB"
 
+    # 自动检测链路速度
+    local link_mbps recommended_mb detect_note=""
+    LINK_IFACE=""; LINK_SOURCE=""
+    link_mbps=$(detect_link_speed_mbps) || link_mbps=""
+    if [ -n "$link_mbps" ]; then
+        recommended_mb=$(mbps_to_buffer_mb "$link_mbps")
+        info "链路检测: ${LINK_IFACE} = ${link_mbps} Mbps (来源: ${LINK_SOURCE}) → 推荐 ${recommended_mb}MB"
+    else
+        recommended_mb=64
+        detect_note="(未检测到链路速度，按 1Gbps 默认)"
+        warn "无法检测链路速度 ${detect_note}，推荐 ${recommended_mb}MB"
+    fi
+
     # 缓冲档位选择
     echo ""
-    echo -e "${BOLD}请按服务器带宽选择 TCP 缓冲档位:${NC}"
-    echo "  1) 16MB   (≤100Mbps / 小内存保守)"
-    echo "  2) 32MB   (100-500Mbps 标准)"
-    echo "  3) 64MB   (500Mbps-1Gbps 推荐)"
-    echo "  4) 128MB  (1-2.5Gbps)"
-    echo "  5) 256MB  (≥2.5Gbps 极限)"
+    echo -e "${BOLD}请选择 TCP 缓冲档位:${NC}"
+    echo -e "  1) 使用推荐值 ${recommended_mb}MB ${GREEN}⭐${NC} (默认)"
+    echo "  2) 16MB    (≤100Mbps / 小内存保守)"
+    echo "  3) 32MB    (100-500Mbps)"
+    echo "  4) 64MB    (500Mbps-1Gbps)"
+    echo "  5) 128MB   (1-2.5Gbps)"
+    echo "  6) 256MB   (≥2.5Gbps)"
+    echo "  7) 跑 Ookla speedtest 实测后再决定 (~30-60s)"
+    echo "  8) 手动输入 MB (4-512)"
     echo ""
     echo "  提示: 缓冲不是越大越好，过大会增加内存压力和 bufferbloat。"
     echo ""
-    ask "${BOLD}选择 [3]: ${NC}" BUF_CHOICE
+    ask "${BOLD}选择 [1]: ${NC}" BUF_CHOICE
 
     local buffer_mb
-    case "${BUF_CHOICE:-3}" in
-        1) buffer_mb=16 ;;
-        2) buffer_mb=32 ;;
-        3) buffer_mb=64 ;;
-        4) buffer_mb=128 ;;
-        5) buffer_mb=256 ;;
-        *) buffer_mb=64 ;;
+    case "${BUF_CHOICE:-1}" in
+        1) buffer_mb=$recommended_mb ;;
+        2) buffer_mb=16 ;;
+        3) buffer_mb=32 ;;
+        4) buffer_mb=64 ;;
+        5) buffer_mb=128 ;;
+        6) buffer_mb=256 ;;
+        7)
+            local st_mbps
+            if st_mbps=$(run_speedtest_mbps); then
+                local st_recommended
+                st_recommended=$(mbps_to_buffer_mb "$st_mbps")
+                info "speedtest 上传: ${st_mbps} Mbps → 推荐 ${st_recommended}MB"
+                ask "${BOLD}使用此推荐值？[Y/n]: ${NC}" USE_ST
+                if [[ ! "$USE_ST" =~ ^[Nn]$ ]]; then
+                    buffer_mb=$st_recommended
+                else
+                    buffer_mb=$recommended_mb
+                fi
+            else
+                warn "speedtest 失败，回退到 ethtool 推荐 ${recommended_mb}MB"
+                buffer_mb=$recommended_mb
+            fi
+            ;;
+        8)
+            local manual=""
+            while true; do
+                ask "${BOLD}请输入缓冲大小 MB (4-512): ${NC}" manual
+                if [[ "$manual" =~ ^[0-9]+$ ]] && [ "$manual" -ge 4 ] && [ "$manual" -le 512 ]; then
+                    buffer_mb=$manual; break
+                fi
+                warn "请输入 4-512 之间的整数"
+            done
+            ;;
+        *) buffer_mb=$recommended_mb ;;
     esac
 
     # 内存上限保护
